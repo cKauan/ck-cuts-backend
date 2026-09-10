@@ -104,9 +104,9 @@ def render_cut(request: CutRequest):
         ydl_opts = {
             # Limita a 1080p para reduzir consumo de memória
             "format": (
-                "bestvideo[height<=1080]+bestaudio/"
-                "best[height<=1080]/"
-                "best"
+            "bestvideo[height<=1080]+bestaudio/"
+            "bestvideo+bestaudio/"
+            "best"
             ),
 
             "outtmpl": source_template,
