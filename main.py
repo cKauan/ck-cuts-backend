@@ -4,6 +4,7 @@ from pydantic import BaseModel
 import yt_dlp
 import os
 import uuid
+import subprocess
 
 app = FastAPI(title="CK Cuts Backend")
 
@@ -51,12 +52,16 @@ def render_cut(request: CutRequest):
         )
 
     job_id = str(uuid.uuid4())
+
+    source = os.path.join(OUTPUT_DIR, f"{job_id}_source.%(ext)s")
     output = os.path.join(OUTPUT_DIR, f"{job_id}.mp4")
 
     try:
+
+        # Baixa no máximo 1080p para evitar estouro de memória
         ydl_opts = {
-            "format": "bestvideo+bestaudio/best",
-            "outtmpl": output,
+            "format": "bestvideo[height<=1080]+bestaudio/best[height<=1080]/best",
+            "outtmpl": source,
             "merge_output_format": "mp4",
             "download_ranges": yt_dlp.utils.download_range_func(
                 None,
@@ -64,13 +69,55 @@ def render_cut(request: CutRequest):
             ),
             "force_keyframes_at_cuts": True,
             "noplaylist": True,
+            "concurrent_fragment_downloads": 1,
         }
 
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             ydl.download([request.youtube_url])
 
-        if not os.path.exists(output):
-            raise Exception("Arquivo de vídeo não foi criado.")
+        # Localiza o arquivo baixado
+        source_file = None
+
+        for file in os.listdir(OUTPUT_DIR):
+            if file.startswith(job_id + "_source"):
+                source_file = os.path.join(OUTPUT_DIR, file)
+                break
+
+        if not source_file or not os.path.exists(source_file):
+            raise Exception("Arquivo de origem não encontrado.")
+
+        # Conversão para TikTok 9:16
+        command = [
+            "ffmpeg",
+            "-y",
+            "-i",
+            source_file,
+            "-vf",
+            "scale=1080:1920:force_original_aspect_ratio=decrease,"
+            "pad=1080:1920:(ow-iw)/2:(oh-ih)/2",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-crf",
+            "26",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "128k",
+            "-movflags",
+            "+faststart",
+            output
+        ]
+
+        subprocess.run(
+            command,
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE
+        )
+
+        os.remove(source_file)
 
         return {
             "status": "completed",
@@ -79,7 +126,15 @@ def render_cut(request: CutRequest):
             "output_file": output
         }
 
+    except subprocess.CalledProcessError as e:
+
+        raise HTTPException(
+            status_code=500,
+            detail="FFmpeg falhou durante o processamento."
+        )
+
     except Exception as e:
+
         raise HTTPException(
             status_code=500,
             detail=str(e)
