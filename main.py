@@ -1,11 +1,12 @@
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import yt_dlp
 import os
 import uuid
-import subprocess
 import tempfile
+import glob
 
 app = FastAPI(title="CK Cuts Backend")
 
@@ -52,8 +53,8 @@ def create_cookie_file():
     return path
 
 
-@app.post("/api/cuts/render")
-def render_cut(request: CutRequest):
+@app.post("/api/cuts/download")
+def download_cut(request: CutRequest):
 
     if request.end_time <= request.start_time:
         raise HTTPException(
@@ -69,45 +70,37 @@ def render_cut(request: CutRequest):
             detail="O corte não pode ultrapassar 3 minutos."
         )
 
+    if duration < 1:
+        raise HTTPException(
+            status_code=400,
+            detail="O corte precisa ter pelo menos 1 segundo."
+        )
+
     job_id = str(uuid.uuid4())
 
-    source_template = os.path.join(
+    output_template = os.path.join(
         OUTPUT_DIR,
-        f"{job_id}_source.%(ext)s"
+        f"{job_id}.%(ext)s"
     )
 
-    output = os.path.join(
-        OUTPUT_DIR,
-        f"{job_id}.mp4"
-    )
-
-    cookie_file = None
-    source_file = None
+    cookie_file = create_cookie_file()
 
     try:
 
-        # --------------------------------------------------
-        # COOKIES
-        # --------------------------------------------------
-
-        cookie_file = create_cookie_file()
-
-        # --------------------------------------------------
-        # DOWNLOAD
-        # --------------------------------------------------
-
         ydl_opts = {
-            # Limita o download para reduzir RAM
+            # Melhor qualidade disponível até 1080p.
+            # Sem reencode.
             "format": (
-                "bestvideo[height<=720]+bestaudio/"
-                "best[height<=720]/"
+                "bestvideo[height<=1080]+bestaudio/"
+                "best[height<=1080]/"
                 "best"
             ),
 
-            "outtmpl": source_template,
+            "outtmpl": output_template,
 
             "merge_output_format": "mp4",
 
+            # Baixa somente o intervalo escolhido
             "download_ranges": yt_dlp.utils.download_range_func(
                 None,
                 [
@@ -120,10 +113,10 @@ def render_cut(request: CutRequest):
 
             "noplaylist": True,
 
-            # Apenas uma parte por vez
+            # Reduz consumo do servidor
             "concurrent_fragment_downloads": 1,
 
-            # JS runtime
+            # YouTube / EJS
             "js_runtimes": {
                 "node": {}
             },
@@ -132,6 +125,10 @@ def render_cut(request: CutRequest):
                 "ejs:github"
             ],
 
+            # Cookies
+            "cookiefile": cookie_file,
+
+            # Navegador
             "http_headers": {
                 "User-Agent": (
                     "Mozilla/5.0 (X11; Linux x86_64) "
@@ -142,118 +139,58 @@ def render_cut(request: CutRequest):
             },
 
             "quiet": False,
+            "no_warnings": False,
         }
 
-        if cookie_file:
-            ydl_opts["cookiefile"] = cookie_file
+        if not cookie_file:
+            ydl_opts.pop("cookiefile", None)
+
+        # -----------------------------------------------
+        # DOWNLOAD
+        # -----------------------------------------------
 
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             ydl.download([request.youtube_url])
 
-        # --------------------------------------------------
-        # LOCALIZA SOURCE
-        # --------------------------------------------------
+        # -----------------------------------------------
+        # LOCALIZA ARQUIVO
+        # -----------------------------------------------
 
-        for filename in os.listdir(OUTPUT_DIR):
-
-            if filename.startswith(
-                job_id + "_source"
-            ):
-
-                candidate = os.path.join(
-                    OUTPUT_DIR,
-                    filename
-                )
-
-                if os.path.isfile(candidate):
-                    source_file = candidate
-                    break
-
-        if not source_file:
-            raise Exception(
-                "Arquivo de origem não encontrado."
+        files = glob.glob(
+            os.path.join(
+                OUTPUT_DIR,
+                f"{job_id}.*"
             )
-
-        # --------------------------------------------------
-        # FFMPEG
-        # --------------------------------------------------
-
-        command = [
-            "ffmpeg",
-            "-y",
-
-            "-threads",
-            "1",
-
-            "-i",
-            source_file,
-
-            # Vertical 9:16
-            "-vf",
-            (
-                "scale=1080:1920:"
-                "force_original_aspect_ratio=increase,"
-                "crop=1080:1920"
-            ),
-
-            "-c:v",
-            "libx264",
-
-            # Extremamente rápido
-            "-preset",
-            "ultrafast",
-
-            # Menor esforço de processamento
-            "-crf",
-            "28",
-
-            "-c:a",
-            "aac",
-
-            "-b:a",
-            "128k",
-
-            "-movflags",
-            "+faststart",
-
-            output
-        ]
-
-        log_path = os.path.join(
-            OUTPUT_DIR,
-            f"{job_id}.log"
         )
 
-        with open(log_path, "w") as log:
+        files = [
+            f for f in files
+            if not f.endswith(".log")
+        ]
 
-            subprocess.run(
-                command,
-                check=True,
-                stdout=log,
-                stderr=log
-            )
-
-        if not os.path.exists(output):
+        if not files:
             raise Exception(
-                "Arquivo final não foi criado."
+                "O vídeo não foi encontrado após o download."
             )
 
-        # --------------------------------------------------
-        # LIMPEZA
-        # --------------------------------------------------
+        output_file = files[0]
 
-        if source_file and os.path.exists(source_file):
-            os.remove(source_file)
+        # -----------------------------------------------
+        # LIMPA COOKIE TEMPORÁRIO
+        # -----------------------------------------------
 
         if cookie_file and os.path.exists(cookie_file):
             os.remove(cookie_file)
 
-        return {
-            "status": "completed",
-            "job_id": job_id,
-            "progress": 100,
-            "output_file": output
-        }
+        # -----------------------------------------------
+        # RETORNA ARQUIVO
+        # -----------------------------------------------
+
+        return FileResponse(
+            output_file,
+            media_type="video/mp4",
+            filename=f"ck-cuts-{job_id}.mp4"
+        )
 
     except yt_dlp.utils.DownloadError as e:
 
@@ -263,16 +200,6 @@ def render_cut(request: CutRequest):
         raise HTTPException(
             status_code=500,
             detail=f"Erro ao baixar o vídeo do YouTube: {str(e)}"
-        )
-
-    except subprocess.CalledProcessError:
-
-        if cookie_file and os.path.exists(cookie_file):
-            os.remove(cookie_file)
-
-        raise HTTPException(
-            status_code=500,
-            detail="FFmpeg falhou durante o processamento."
         )
 
     except Exception as e:
