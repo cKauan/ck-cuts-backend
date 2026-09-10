@@ -37,8 +37,8 @@ def health():
 
 def create_cookie_file():
     """
-    Cria temporariamente um cookies.txt a partir da variável
-    YOUTUBE_COOKIES configurada no Railway.
+    Cria temporariamente um cookies.txt usando
+    a variável YOUTUBE_COOKIES do Railway.
     """
 
     cookies = os.getenv("YOUTUBE_COOKIES")
@@ -51,7 +51,12 @@ def create_cookie_file():
         "youtube_cookies.txt"
     )
 
-    with open(cookie_file, "w", encoding="utf-8", newline="\n") as f:
+    with open(
+        cookie_file,
+        "w",
+        encoding="utf-8",
+        newline="\n"
+    ) as f:
         f.write(cookies)
 
     return cookie_file
@@ -59,6 +64,10 @@ def create_cookie_file():
 
 @app.post("/api/cuts/render")
 def render_cut(request: CutRequest):
+
+    # ---------------------------------------------------------
+    # VALIDAÇÕES
+    # ---------------------------------------------------------
 
     if request.end_time <= request.start_time:
         raise HTTPException(
@@ -72,6 +81,12 @@ def render_cut(request: CutRequest):
         raise HTTPException(
             status_code=400,
             detail="O corte não pode ultrapassar 3 minutos."
+        )
+
+    if duration <= 0:
+        raise HTTPException(
+            status_code=400,
+            detail="Duração inválida."
         )
 
     job_id = str(uuid.uuid4())
@@ -91,46 +106,63 @@ def render_cut(request: CutRequest):
 
     try:
 
-        # ---------------------------------------------------------
+        # -----------------------------------------------------
         # COOKIES
-        # ---------------------------------------------------------
+        # -----------------------------------------------------
 
         cookie_file = create_cookie_file()
 
-        # ---------------------------------------------------------
-        # DOWNLOAD DO TRECHO DO YOUTUBE
-        # ---------------------------------------------------------
+        # -----------------------------------------------------
+        # YT-DLP
+        # -----------------------------------------------------
 
         ydl_opts = {
-            # Limita a 1080p para reduzir consumo de memória
+
+            # Tenta primeiro até 1080p.
+            # Se não existir, cai para qualquer
+            # combinação disponível.
             "format": (
-            "bestvideo[height<=1080]+bestaudio/"
-            "bestvideo+bestaudio/"
-            "best"
+                "bestvideo[height<=1080]+bestaudio/"
+                "bestvideo+bestaudio/"
+                "best"
             ),
 
             "outtmpl": source_template,
 
             "merge_output_format": "mp4",
 
+            # Baixa somente o intervalo solicitado
             "download_ranges": yt_dlp.utils.download_range_func(
                 None,
-                [(request.start_time, request.end_time)]
+                [
+                    (
+                        request.start_time,
+                        request.end_time
+                    )
+                ]
             ),
 
             "force_keyframes_at_cuts": True,
 
             "noplaylist": True,
 
-            # Reduz consumo de RAM
+            # Reduz consumo de memória
             "concurrent_fragment_downloads": 1,
 
-            # Evita mensagens desnecessárias
-            "quiet": True,
+            # Runtime JavaScript
+            "js_runtimes": {
+                "node": {}
+            },
 
-            "no_warnings": True,
+            # Permite ao yt-dlp obter os componentes EJS
+            "remote_components": [
+                "ejs:github"
+            ],
 
-            # User-Agent semelhante a navegador
+            # Cookies
+            "cookiefile": cookie_file,
+
+            # User-Agent
             "http_headers": {
                 "User-Agent": (
                     "Mozilla/5.0 (X11; Linux x86_64) "
@@ -139,22 +171,32 @@ def render_cut(request: CutRequest):
                     "Chrome/140.0.0.0 Safari/537.36"
                 )
             },
+
+            "quiet": False,
+
+            "no_warnings": False,
         }
 
-        # Só adiciona cookies se YOUTUBE_COOKIES existir
-        if cookie_file:
-            ydl_opts["cookiefile"] = cookie_file
+        # Se não houver cookie, remove a opção
+        if not cookie_file:
+            ydl_opts.pop("cookiefile", None)
+
+        # -----------------------------------------------------
+        # DOWNLOAD
+        # -----------------------------------------------------
 
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             ydl.download([request.youtube_url])
 
-        # ---------------------------------------------------------
-        # LOCALIZA O ARQUIVO BAIXADO
-        # ---------------------------------------------------------
+        # -----------------------------------------------------
+        # ENCONTRA O ARQUIVO BAIXADO
+        # -----------------------------------------------------
 
         for file in os.listdir(OUTPUT_DIR):
 
-            if file.startswith(job_id + "_source"):
+            if file.startswith(
+                job_id + "_source"
+            ):
 
                 candidate = os.path.join(
                     OUTPUT_DIR,
@@ -166,22 +208,30 @@ def render_cut(request: CutRequest):
                     break
 
         if not source_file:
+
             raise Exception(
-                "O arquivo de origem não foi encontrado após o download."
+                "O arquivo de origem não foi encontrado "
+                "após o download."
             )
 
-        # ---------------------------------------------------------
+        # -----------------------------------------------------
         # FFMPEG
-        # ---------------------------------------------------------
+        # -----------------------------------------------------
+
+        log_path = os.path.join(
+            OUTPUT_DIR,
+            f"{job_id}.log"
+        )
 
         command = [
+
             "ffmpeg",
             "-y",
 
             "-i",
             source_file,
 
-            # Formato vertical 9:16
+            # Vertical 9:16
             "-vf",
             (
                 "scale=1080:1920:"
@@ -189,15 +239,15 @@ def render_cut(request: CutRequest):
                 "crop=1080:1920"
             ),
 
-            # H.264
+            # H264
             "-c:v",
             "libx264",
 
-            # Mais rápido / menor consumo
+            # Velocidade
             "-preset",
             "veryfast",
 
-            # Qualidade razoável para TikTok
+            # Qualidade
             "-crf",
             "26",
 
@@ -208,19 +258,15 @@ def render_cut(request: CutRequest):
             "-b:a",
             "128k",
 
-            # Otimiza MP4 para reprodução
             "-movflags",
             "+faststart",
 
             output
         ]
 
-        # Não guardar todo o log do FFmpeg na memória
+        # Não acumula o log na RAM
         with open(
-            os.path.join(
-                OUTPUT_DIR,
-                f"{job_id}.log"
-            ),
+            log_path,
             "w"
         ) as log_file:
 
@@ -231,18 +277,20 @@ def render_cut(request: CutRequest):
                 stderr=log_file
             )
 
-        # ---------------------------------------------------------
-        # VERIFICA SAÍDA
-        # ---------------------------------------------------------
+        # -----------------------------------------------------
+        # VERIFICA RESULTADO
+        # -----------------------------------------------------
 
         if not os.path.exists(output):
+
             raise Exception(
-                "O FFmpeg terminou, mas o arquivo final não foi criado."
+                "O FFmpeg terminou, mas o arquivo final "
+                "não foi criado."
             )
 
-        # ---------------------------------------------------------
+        # -----------------------------------------------------
         # LIMPEZA
-        # ---------------------------------------------------------
+        # -----------------------------------------------------
 
         if source_file and os.path.exists(source_file):
             os.remove(source_file)
@@ -264,7 +312,10 @@ def render_cut(request: CutRequest):
 
         raise HTTPException(
             status_code=500,
-            detail=f"Erro ao baixar o vídeo do YouTube: {str(e)}"
+            detail=(
+                "Erro ao baixar o vídeo do YouTube: "
+                f"{str(e)}"
+            )
         )
 
     except subprocess.CalledProcessError:
