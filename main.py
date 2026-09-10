@@ -5,6 +5,7 @@ import yt_dlp
 import os
 import uuid
 import subprocess
+import tempfile
 
 app = FastAPI(title="CK Cuts Backend")
 
@@ -34,6 +35,28 @@ def health():
     }
 
 
+def create_cookie_file():
+    """
+    Cria temporariamente um cookies.txt a partir da variável
+    YOUTUBE_COOKIES configurada no Railway.
+    """
+
+    cookies = os.getenv("YOUTUBE_COOKIES")
+
+    if not cookies:
+        return None
+
+    cookie_file = os.path.join(
+        tempfile.gettempdir(),
+        "youtube_cookies.txt"
+    )
+
+    with open(cookie_file, "w", encoding="utf-8", newline="\n") as f:
+        f.write(cookies)
+
+    return cookie_file
+
+
 @app.post("/api/cuts/render")
 def render_cut(request: CutRequest):
 
@@ -53,71 +76,179 @@ def render_cut(request: CutRequest):
 
     job_id = str(uuid.uuid4())
 
-    source = os.path.join(OUTPUT_DIR, f"{job_id}_source.%(ext)s")
-    output = os.path.join(OUTPUT_DIR, f"{job_id}.mp4")
+    source_template = os.path.join(
+        OUTPUT_DIR,
+        f"{job_id}_source.%(ext)s"
+    )
+
+    output = os.path.join(
+        OUTPUT_DIR,
+        f"{job_id}.mp4"
+    )
+
+    cookie_file = None
+    source_file = None
 
     try:
 
-        # Baixa no máximo 1080p para evitar estouro de memória
+        # ---------------------------------------------------------
+        # COOKIES
+        # ---------------------------------------------------------
+
+        cookie_file = create_cookie_file()
+
+        # ---------------------------------------------------------
+        # DOWNLOAD DO TRECHO DO YOUTUBE
+        # ---------------------------------------------------------
+
         ydl_opts = {
-            "format": "bestvideo[height<=1080]+bestaudio/best[height<=1080]/best",
-            "outtmpl": source,
+            # Limita a 1080p para reduzir consumo de memória
+            "format": (
+                "bestvideo[height<=1080]+bestaudio/"
+                "best[height<=1080]/"
+                "best"
+            ),
+
+            "outtmpl": source_template,
+
             "merge_output_format": "mp4",
+
             "download_ranges": yt_dlp.utils.download_range_func(
                 None,
                 [(request.start_time, request.end_time)]
             ),
+
             "force_keyframes_at_cuts": True,
+
             "noplaylist": True,
+
+            # Reduz consumo de RAM
             "concurrent_fragment_downloads": 1,
+
+            # Evita mensagens desnecessárias
+            "quiet": True,
+
+            "no_warnings": True,
+
+            # User-Agent semelhante a navegador
+            "http_headers": {
+                "User-Agent": (
+                    "Mozilla/5.0 (X11; Linux x86_64) "
+                    "AppleWebKit/537.36 "
+                    "(KHTML, like Gecko) "
+                    "Chrome/140.0.0.0 Safari/537.36"
+                )
+            },
         }
+
+        # Só adiciona cookies se YOUTUBE_COOKIES existir
+        if cookie_file:
+            ydl_opts["cookiefile"] = cookie_file
 
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             ydl.download([request.youtube_url])
 
-        # Localiza o arquivo baixado
-        source_file = None
+        # ---------------------------------------------------------
+        # LOCALIZA O ARQUIVO BAIXADO
+        # ---------------------------------------------------------
 
         for file in os.listdir(OUTPUT_DIR):
+
             if file.startswith(job_id + "_source"):
-                source_file = os.path.join(OUTPUT_DIR, file)
-                break
 
-        if not source_file or not os.path.exists(source_file):
-            raise Exception("Arquivo de origem não encontrado.")
+                candidate = os.path.join(
+                    OUTPUT_DIR,
+                    file
+                )
 
-        # Conversão para TikTok 9:16
+                if os.path.isfile(candidate):
+                    source_file = candidate
+                    break
+
+        if not source_file:
+            raise Exception(
+                "O arquivo de origem não foi encontrado após o download."
+            )
+
+        # ---------------------------------------------------------
+        # FFMPEG
+        # ---------------------------------------------------------
+
         command = [
             "ffmpeg",
             "-y",
+
             "-i",
             source_file,
+
+            # Formato vertical 9:16
             "-vf",
-            "scale=1080:1920:force_original_aspect_ratio=decrease,"
-            "pad=1080:1920:(ow-iw)/2:(oh-ih)/2",
+            (
+                "scale=1080:1920:"
+                "force_original_aspect_ratio=increase,"
+                "crop=1080:1920"
+            ),
+
+            # H.264
             "-c:v",
             "libx264",
+
+            # Mais rápido / menor consumo
             "-preset",
             "veryfast",
+
+            # Qualidade razoável para TikTok
             "-crf",
             "26",
+
+            # Áudio
             "-c:a",
             "aac",
+
             "-b:a",
             "128k",
+
+            # Otimiza MP4 para reprodução
             "-movflags",
             "+faststart",
+
             output
         ]
 
-        subprocess.run(
-            command,
-            check=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE
-        )
+        # Não guardar todo o log do FFmpeg na memória
+        with open(
+            os.path.join(
+                OUTPUT_DIR,
+                f"{job_id}.log"
+            ),
+            "w"
+        ) as log_file:
 
-        os.remove(source_file)
+            subprocess.run(
+                command,
+                check=True,
+                stdout=log_file,
+                stderr=log_file
+            )
+
+        # ---------------------------------------------------------
+        # VERIFICA SAÍDA
+        # ---------------------------------------------------------
+
+        if not os.path.exists(output):
+            raise Exception(
+                "O FFmpeg terminou, mas o arquivo final não foi criado."
+            )
+
+        # ---------------------------------------------------------
+        # LIMPEZA
+        # ---------------------------------------------------------
+
+        if source_file and os.path.exists(source_file):
+            os.remove(source_file)
+
+        if cookie_file and os.path.exists(cookie_file):
+            os.remove(cookie_file)
 
         return {
             "status": "completed",
@@ -126,7 +257,20 @@ def render_cut(request: CutRequest):
             "output_file": output
         }
 
-    except subprocess.CalledProcessError as e:
+    except yt_dlp.utils.DownloadError as e:
+
+        if cookie_file and os.path.exists(cookie_file):
+            os.remove(cookie_file)
+
+        raise HTTPException(
+            status_code=500,
+            detail=f"Erro ao baixar o vídeo do YouTube: {str(e)}"
+        )
+
+    except subprocess.CalledProcessError:
+
+        if cookie_file and os.path.exists(cookie_file):
+            os.remove(cookie_file)
 
         raise HTTPException(
             status_code=500,
@@ -134,6 +278,9 @@ def render_cut(request: CutRequest):
         )
 
     except Exception as e:
+
+        if cookie_file and os.path.exists(cookie_file):
+            os.remove(cookie_file)
 
         raise HTTPException(
             status_code=500,
